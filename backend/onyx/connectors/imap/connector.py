@@ -313,7 +313,11 @@ def _fetch_email_ids_in_mailbox(
     if status != _IMAP_OKAY_STATUS or not email_ids_byte_array:
         raise RuntimeError(f"Failed to fetch email ids; {status=}")
 
-    email_ids: bytes = email_ids_byte_array[0]
+    email_ids = email_ids_byte_array[0]
+    if email_ids is None:
+        # Some IMAP servers return [None] (rather than [b'']) when a SEARCH
+        # produces no matches; treat as an empty result.
+        return []
 
     return [email_id.decode() for email_id in email_ids.split()]
 
@@ -325,9 +329,15 @@ def _fetch_email(mail_client: imaplib.IMAP4_SSL, email_id: str) -> Message | Non
 
     data = msg_data[0]
     if not isinstance(data, tuple):
-        raise RuntimeError(
-            f"Message data should be a tuple; instead got a {type(data)=} {data=}"
+        # If the message was expunged between SEARCH and FETCH (or otherwise
+        # has no RFC822 content available), the server returns just bytes like
+        # b'<seq> ()' instead of a (header, body) tuple. Skip rather than fail.
+        logger.warning(
+            "FETCH for email_id=%r returned no message data (data=%r); skipping",
+            email_id,
+            data,
         )
+        return None
 
     _metadata, raw_email = data
     return email.message_from_bytes(raw_email)
