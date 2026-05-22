@@ -194,6 +194,11 @@ def is_valid_url(url: str) -> bool:
         return False
 
 
+_DOC_LIKE_EXTENSIONS = frozenset(
+    {".htm", ".html", ".xhtml", ".pdf", ".aspx", ".asp", ".jsp", ".php", ".xml"}
+)
+
+
 def _same_site(base_url: str, candidate_url: str) -> bool:
     base, candidate = urlparse(base_url), urlparse(candidate_url)
     base_netloc = base.netloc.lower().removeprefix("www.")
@@ -201,7 +206,21 @@ def _same_site(base_url: str, candidate_url: str) -> bool:
     if base_netloc != candidate_netloc:
         return False
 
-    base_path = (base.path or "/").rstrip("/")
+    base_path = base.path or "/"
+    # If the base URL points at a specific document file (no trailing slash,
+    # last segment ends in a recognized doc extension), treat the containing
+    # directory as the recursion scope. Otherwise sibling pages get rejected
+    # as off-site because the file path can never be their prefix.
+    if not base_path.endswith("/"):
+        last_segment = base_path.rsplit("/", 1)[-1]
+        ext_idx = last_segment.rfind(".")
+        if (
+            ext_idx > 0
+            and last_segment[ext_idx:].lower() in _DOC_LIKE_EXTENSIONS
+        ):
+            base_path = base_path.rsplit("/", 1)[0] or "/"
+
+    base_path = base_path.rstrip("/")
     if base_path in ("", "/"):
         return True
 
@@ -211,6 +230,53 @@ def _same_site(base_url: str, candidate_url: str) -> bool:
 
     boundary = f"{base_path}/"
     return candidate_path.startswith(boundary)
+
+
+_SHADOW_LINK_JS = """
+() => {
+  const out = [];
+  const seen = new WeakSet();
+  const walk = (root) => {
+    if (!root || !root.querySelectorAll || seen.has(root)) return;
+    seen.add(root);
+    root.querySelectorAll('a[href]').forEach(a => out.push(a.href));
+    root.querySelectorAll('*').forEach(el => { if (el.shadowRoot) walk(el.shadowRoot); });
+  };
+  walk(document);
+  return out;
+}
+"""
+
+
+def _collect_shadow_dom_links(page: Any, base_url: str) -> set[str]:
+    """Pull same-site anchor hrefs from inside attached shadow roots.
+
+    BeautifulSoup parses the serialized HTML returned by Playwright's
+    `page.content()`, which does not include shadow root content. Sites
+    that render navigation inside web components (Salesforce developer
+    docs, Stencil-based portals, etc.) hide TOC anchors from the default
+    scrape path. This walks every reachable shadow root and returns the
+    hrefs that pass the same-site filter.
+    """
+    try:
+        raw = page.evaluate(_SHADOW_LINK_JS)
+    except Exception as e:
+        logger.debug("shadow-dom link extraction failed: %s", e)
+        return set()
+
+    results: set[str] = set()
+    for href in raw or []:
+        if not isinstance(href, str) or not href:
+            continue
+        # Strip in-page fragments. Hashbang routes (#!) are real navigation
+        # state, so leave those alone (mirrors get_internal_links).
+        if "#" in href and "#!" not in href:
+            href = href.split("#", 1)[0]
+        if not href:
+            continue
+        if _same_site(base_url, href):
+            results.add(href)
+    return results
 
 
 def get_internal_links(
@@ -552,6 +618,13 @@ class WebConnector(LoadConnector, SlimConnector):
             if self.recursive:
                 internal_links = get_internal_links(
                     session_ctx.base_url, initial_url, soup
+                )
+                # Custom-element-driven sites (e.g. Salesforce developer
+                # docs) keep TOC anchors inside attached shadow roots, which
+                # `page.content()` does not serialize. Walk shadow roots via
+                # page.evaluate to surface those links too.
+                internal_links |= _collect_shadow_dom_links(
+                    page, session_ctx.base_url
                 )
                 for link in internal_links:
                     if link not in session_ctx.visited_links:
