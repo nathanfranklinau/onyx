@@ -88,6 +88,52 @@ from onyx.utils.logger import setup_logger
 logger = setup_logger()
 
 
+def _patch_mcp_pkce_alphabet() -> None:
+    """Force the MCP SDK's PKCE code_verifier to use only the base64url alphabet.
+
+    RFC 7636 permits the unreserved set `[A-Za-z0-9-._~]` for `code_verifier`,
+    and the mcp SDK (>=1.27) uses that full set. Salesforce's OAuth server
+    accepts a code_verifier containing `~` or `.` at the token endpoint but
+    silently mangles those bytes before recomputing the SHA-256, so the
+    challenge it stored at /authorize never matches and every PKCE token
+    exchange fails with `invalid_grant: invalid code verifier` — even though
+    SHA-256(verifier) equals the challenge we sent.
+
+    Restricting verifiers to `[A-Za-z0-9-_]` (the base64url alphabet, minus
+    `.~`) stays fully RFC-compliant and sidesteps the Salesforce bug while
+    remaining safe for every other provider.
+    """
+    import secrets
+    import string
+
+    import mcp.client.auth.oauth2 as _mcp_oauth2  # type: ignore[import-untyped]
+
+    if getattr(_mcp_oauth2, "_onyx_pkce_alphabet_patched", False):
+        return
+
+    _safe_alphabet = string.ascii_letters + string.digits + "-_"
+    _orig_generate = _mcp_oauth2.PKCEParameters.generate  # type: ignore[attr-defined]
+
+    @classmethod  # type: ignore[misc]
+    def _generate_safe(cls):  # type: ignore[no-untyped-def]
+        import base64
+        import hashlib
+
+        code_verifier = "".join(secrets.choice(_safe_alphabet) for _ in range(128))
+        digest = hashlib.sha256(code_verifier.encode()).digest()
+        code_challenge = base64.urlsafe_b64encode(digest).decode().rstrip("=")
+        return cls(code_verifier=code_verifier, code_challenge=code_challenge)
+
+    _mcp_oauth2.PKCEParameters.generate = _generate_safe  # type: ignore[attr-defined]
+    _mcp_oauth2._onyx_pkce_alphabet_patched = True  # type: ignore[attr-defined]
+    # Reference _orig_generate so static analyzers don't drop the import path
+    # if we ever need to restore it.
+    _mcp_oauth2._onyx_pkce_original_generate = _orig_generate  # type: ignore[attr-defined]
+
+
+_patch_mcp_pkce_alphabet()
+
+
 def _truncate_description(description: str | None, max_length: int = 500) -> str:
     """Truncate description to max_length characters, adding ellipsis if truncated."""
     if not description:
