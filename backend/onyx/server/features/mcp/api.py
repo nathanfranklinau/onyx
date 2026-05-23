@@ -359,6 +359,16 @@ def make_oauth_provider(
         if return_path == UNUSED_RETURN_PATH:
             raise ValueError("Please Reconnect to the server")
         r = get_redis_client()
+        # The MCP SDK builds the URL with `f"{auth_url_base}?{urlencode(...)}"`,
+        # which produces a double `?` when the discovered authorization_endpoint
+        # already carries a query string (e.g. Salesforce advertises
+        # `.../authorize?prompt=select_account`). Browsers and OAuth servers
+        # treat the second `?` as part of a param name, breaking the request
+        # (Salesforce returns `unsupported_response_type`). Collapse any extra
+        # `?` after the first into `&`.
+        scheme_sep, _, rest = auth_url.partition("?")
+        if rest:
+            auth_url = f"{scheme_sep}?{rest.replace('?', '&')}"
         # The SDK generated & embedded 'state' in the auth_url; extract & store it.
         parsed = urlparse(auth_url)
         qs = dict([p.split("=", 1) for p in parsed.query.split("&") if "=" in p])
