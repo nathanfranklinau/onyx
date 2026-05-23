@@ -3,8 +3,10 @@ import base64
 import datetime
 import hashlib
 import json
+import time
 from enum import Enum
 from secrets import token_urlsafe
+from typing import Any
 from typing import cast
 from typing import Literal
 from urllib.parse import urlparse
@@ -132,6 +134,128 @@ def _patch_mcp_pkce_alphabet() -> None:
 
 
 _patch_mcp_pkce_alphabet()
+
+
+# ---------------------------------------------------------------------------
+# OAuth token-expiry persistence
+# ---------------------------------------------------------------------------
+#
+# `OAuthToken.expires_in` is the LIFETIME at issuance (e.g. 3600 seconds),
+# not remaining lifetime. After persisting and reloading hours later, the
+# value is meaningless on its own. We stamp the persisted payload with an
+# absolute Unix expiry timestamp at write time, and recompute a meaningful
+# relative `expires_in` at read time.
+#
+# This pairs with `OnyxOAuthClientProvider._initialize` (below), which seeds
+# the SDK's in-memory `token_expiry_time` from the hydrated token. Without
+# that seeding, `is_token_valid()` returns True for any stored token
+# (`token_expiry_time` stays None → `not None == True`), the refresh branch
+# is never taken, and every 401 cascades into a full re-auth that requires
+# interactive user redirect — which is exactly the "Please Reconnect"
+# loop users see for Asana and Salesforce when their access tokens age out.
+
+_ABS_EXPIRY_KEY = "_onyx_abs_expiry"
+
+
+def _decode_jwt_exp(access_token: str) -> int | None:
+    """Best-effort decode of the `exp` claim from a JWT access token.
+
+    Returns None for non-JWTs or malformed tokens. The signature is NOT
+    verified — we only need the claim's value for our own runtime expiry
+    tracking, never for trust decisions. The fallback exists to cover IdPs
+    like Salesforce that omit `expires_in` from token responses but still
+    issue JWTs with an `exp` claim.
+    """
+    parts = access_token.split(".")
+    if len(parts) != 3:
+        return None
+    try:
+        payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+    except Exception:
+        return None
+    exp = payload.get("exp") if isinstance(payload, dict) else None
+    if isinstance(exp, (int, float)):
+        return int(exp)
+    return None
+
+
+def _compute_absolute_token_expiry(token: OAuthToken) -> float | None:
+    """Return an absolute Unix expiry timestamp for a freshly-issued token,
+    or None if expiry cannot be determined.
+
+    `expires_in` is the authoritative signal when the IdP provides it.
+    The JWT `exp` claim is a fallback for IdPs (Salesforce) that omit
+    `expires_in` entirely.
+    """
+    if token.expires_in is not None:
+        return time.time() + int(token.expires_in)
+    jwt_exp = _decode_jwt_exp(token.access_token)
+    if jwt_exp is not None:
+        return float(jwt_exp)
+    return None
+
+
+def _attach_absolute_expiry(
+    token_payload: dict[str, Any], token: OAuthToken
+) -> dict[str, Any]:
+    """Stamp the persisted token payload with an absolute expiry timestamp
+    so `_hydrate_token_with_remaining_lifetime` can recompute a meaningful
+    relative `expires_in` on read.
+
+    Returns the (mutated) payload for chaining at the storage call site.
+    """
+    abs_expiry = _compute_absolute_token_expiry(token)
+    if abs_expiry is not None:
+        token_payload[_ABS_EXPIRY_KEY] = abs_expiry
+    return token_payload
+
+
+def _hydrate_token_with_remaining_lifetime(
+    token_payload: dict[str, Any],
+) -> OAuthToken:
+    """Convert a persisted token payload back into an `OAuthToken` with
+    `expires_in` re-derived as `abs_expiry - now` (may be negative).
+
+    Older persisted rows lack the stamp; in that case the original payload
+    is returned unchanged so we degrade to pre-fix behavior (no refresh
+    until the IdP returns 401) instead of breaking auth outright.
+
+    Does NOT mutate `token_payload` — callers (e.g. `extract_connection_data`)
+    return the live dict from the SQLAlchemy attribute, and a side-effect
+    pop would silently corrupt in-memory connection-config state.
+    """
+    payload = {k: v for k, v in token_payload.items() if k != _ABS_EXPIRY_KEY}
+    abs_expiry = token_payload.get(_ABS_EXPIRY_KEY)
+    token = OAuthToken.model_validate(payload)
+    if abs_expiry is not None:
+        token.expires_in = int(abs_expiry - time.time())
+    return token
+
+
+class OnyxOAuthClientProvider(OAuthClientProvider):
+    """`OAuthClientProvider` that seeds the in-memory `token_expiry_time`
+    after storage hydration.
+
+    The upstream SDK only calls `update_token_expiry` when tokens are
+    issued during the current process's auth flow
+    (`_handle_token_response`, `_handle_refresh_response`). When a
+    freshly-constructed provider loads persisted tokens via `_initialize`,
+    `token_expiry_time` stays None, `is_token_valid()` returns True for
+    any token (including long-expired ones), and the refresh branch is
+    never taken — every 401 cascades into a full re-auth that requires
+    interactive user redirect.
+
+    Pairing this with `OnyxTokenStorage`'s absolute-expiry persistence
+    means the loaded token's `expires_in` reflects actual remaining
+    lifetime, so `update_token_expiry` produces a real-world expiry and
+    the SDK's refresh branch fires at the right moment.
+    """
+
+    async def _initialize(self) -> None:
+        await super()._initialize()
+        if self.context.current_tokens is not None:
+            self.context.update_token_expiry(self.context.current_tokens)
 
 
 def _truncate_description(description: str | None, max_length: int = 500) -> str:
@@ -319,14 +443,16 @@ class OnyxTokenStorage(TokenStorage):
             config_data = extract_connection_data(config)
             tokens_raw = config_data.get(MCPOAuthKeys.TOKENS.value)
             if tokens_raw:
-                return OAuthToken.model_validate(tokens_raw)
+                return _hydrate_token_with_remaining_lifetime(tokens_raw)
             return None
 
     async def set_tokens(self, tokens: OAuthToken) -> None:
         with get_session_with_current_tenant() as db_session:
             config = self._ensure_connection_config(db_session)
             config_data = extract_connection_data(config)
-            config_data[MCPOAuthKeys.TOKENS.value] = tokens.model_dump(mode="json")
+            config_data[MCPOAuthKeys.TOKENS.value] = _attach_absolute_expiry(
+                tokens.model_dump(mode="json"), tokens
+            )
             config_data["headers"] = {
                 "Authorization": f"{tokens.token_type} {tokens.access_token}"
             }
@@ -468,7 +594,7 @@ def make_oauth_provider(
         r.delete(key_auth_url(user_id), key_state(user_id))
         return code, state_obj.state
 
-    return OAuthClientProvider(
+    return OnyxOAuthClientProvider(
         server_url=mcp_server.server_url,
         client_metadata=OAuthClientMetadata(
             client_name=f"Onyx - {mcp_server.name}",
