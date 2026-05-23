@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import type { Route } from "next";
 import { SvgCheck, SvgAlertTriangle } from "@opal/icons";
@@ -85,12 +85,30 @@ export default function OAuthCallbackPage({ config }: OAuthCallbackPageProps) {
     config.defaultRedirectPath,
   ]);
 
+  // OAuth callbacks consume single-use codes/state on the server. Without
+  // this guard, React StrictMode's dev-mode double-mount fires two POSTs:
+  // the first succeeds (consuming the state), the second fails with
+  // "Invalid or expired state parameter", and the FE displays the failure.
+  //
+  // We use a ref (not a closure variable) for the "alive" flag so that
+  // StrictMode's transient cleanup→remount sequence resets it back to
+  // true. With a closure `let cancelled`, the first cleanup would set
+  // cancelled=true and the second mount (returning early via hasFiredRef)
+  // would never reset it — causing the fetch's response handler to drop
+  // all state updates even though the component is still mounted.
+  const hasFiredRef = useRef(false);
+  const isAliveRef = useRef(true);
+
   useEffect(() => {
-    const controller = new AbortController();
+    isAliveRef.current = true;
+
+    if (hasFiredRef.current) return () => {};
+    hasFiredRef.current = true;
 
     const handleOAuthCallback = async () => {
       // Handle OAuth error from provider
       if (error) {
+        if (!isAliveRef.current) return;
         setStatusMessage(config.errorMessage || "Authorization Failed");
         setStatusDetails(
           errorDescription ||
@@ -103,6 +121,7 @@ export default function OAuthCallbackPage({ config }: OAuthCallbackPageProps) {
 
       // Validate required parameters
       if (!code || !state) {
+        if (!isAliveRef.current) return;
         setStatusMessage("Invalid Request");
         setStatusDetails(
           "The authorization request was incomplete. Please try again."
@@ -124,7 +143,6 @@ export default function OAuthCallbackPage({ config }: OAuthCallbackPageProps) {
             "Content-Type": "application/json",
           },
           credentials: "include",
-          signal: controller.signal,
         });
 
         if (!response.ok) {
@@ -152,6 +170,7 @@ export default function OAuthCallbackPage({ config }: OAuthCallbackPageProps) {
 
         // Parse the response to get service and redirect information
         const responseData = await response.json();
+        if (!isAliveRef.current) return;
         const result = {
           success: true,
           serviceName:
@@ -191,7 +210,7 @@ export default function OAuthCallbackPage({ config }: OAuthCallbackPageProps) {
         setIsError(false);
         setIsLoading(false);
       } catch (error) {
-        if (controller.signal.aborted) return;
+        if (!isAliveRef.current) return;
         console.error("OAuth callback error:", error);
         setStatusMessage(config.errorMessage || "Something Went Wrong");
         setStatusDetails(
@@ -205,7 +224,9 @@ export default function OAuthCallbackPage({ config }: OAuthCallbackPageProps) {
     };
 
     handleOAuthCallback();
-    return () => controller.abort();
+    return () => {
+      isAliveRef.current = false;
+    };
   }, [code, state, error, errorDescription, searchParams, config]);
 
   const getStatusIcon = () => {
