@@ -80,6 +80,41 @@ def test_web_connector_bot_protection() -> None:
     assert MERCURY_EXPECTED_QUOTE in doc.sections[0].text
 
 
+# Salesforce dev docs render the entire article body inside a shadow root
+# attached to a <docs-article>-style custom element. `page.content()` only
+# serializes the light DOM, so without shadow-DOM flattening only the page
+# title and chrome reach BeautifulSoup. This locks in the flattening behavior
+# in _get_flattened_html.
+def test_web_connector_extracts_shadow_dom_content() -> None:
+    connector = WebConnector(
+        base_url=(
+            "https://developer.salesforce.com/docs/atlas.en-us.apexcode.meta"
+            "/apexcode/apex_reserved_words.htm"
+        ),
+        web_connector_type=WEB_CONNECTOR_VALID_SETTINGS.SINGLE.value,
+    )
+
+    all_docs: list[Document] = []
+    for batch in connector.load_from_state():
+        for doc in batch:
+            if isinstance(doc, HierarchyNode):
+                continue
+            all_docs.append(doc)
+
+    assert len(all_docs) == 1
+    text = all_docs[0].sections[0].text
+    assert text is not None
+
+    # Body must be substantially longer than the page title alone — guards
+    # against regression to title-only extraction.
+    assert len(text) > 500, f"extracted text too short ({len(text)} chars): {text!r}"
+
+    # Apex-specific reserved words appear only in the article body, never in
+    # the title/breadcrumb chrome.
+    for keyword in ("abstract", "transient", "webservice"):
+        assert keyword in text.lower(), f"missing body keyword {keyword!r} in: {text!r}"
+
+
 def test_web_connector_recursive_www_redirect() -> None:
     # Check that https://onyx.app can be recursed if re-directed to www.onyx.app
     # Run in thread pool to avoid conflict with pytest-asyncio's event loop

@@ -248,6 +248,55 @@ _SHADOW_LINK_JS = """
 """
 
 
+# Clones document.documentElement, inlining any open shadow roots as light-DOM
+# children of their host elements, and returns the serialized HTML. The clone
+# leaves the live DOM untouched, so downstream Playwright calls (iframes,
+# shadow link walk, etc.) still see the original tree.
+_FLATTEN_SHADOW_DOM_JS = """
+() => {
+  const flatten = (node) => {
+    if (node.nodeType !== 1) {
+      // Text, comment, etc. - deep clone is fine; no children to recurse into.
+      return node.cloneNode(true);
+    }
+    const clone = node.cloneNode(false);
+    if (node.shadowRoot) {
+      for (const child of node.shadowRoot.childNodes) {
+        clone.appendChild(flatten(child));
+      }
+    }
+    for (const child of node.childNodes) {
+      clone.appendChild(flatten(child));
+    }
+    return clone;
+  };
+  const root = document.documentElement;
+  if (!root) return '';
+  return '<!DOCTYPE html>\\n' + flatten(root).outerHTML;
+}
+"""
+
+
+def _get_flattened_html(page: Any) -> str:
+    """Return the page's HTML with open shadow roots inlined into the light DOM.
+
+    `page.content()` serializes only the light DOM, so sites built on Lightning
+    Web Components or other custom-element frameworks (e.g. Salesforce
+    developer docs) hide their entire article body inside shadow roots and
+    serialize as an empty shell. This walks every reachable shadow root and
+    returns a flattened HTML string that BeautifulSoup can parse normally.
+
+    Falls back to plain `page.content()` if the in-browser flatten errors out.
+    """
+    try:
+        flat = page.evaluate(_FLATTEN_SHADOW_DOM_JS)
+        if isinstance(flat, str) and flat:
+            return flat
+    except Exception as e:
+        logger.debug("shadow-dom flatten failed, falling back to page.content(): %s", e)
+    return page.content()
+
+
 def _collect_shadow_dom_links(page: Any, base_url: str) -> set[str]:
     """Pull same-site anchor hrefs from inside attached shadow roots.
 
@@ -612,7 +661,7 @@ class WebConnector(LoadConnector, SlimConnector):
                         scroll_err,
                     )
 
-            content = page.content()
+            content = _get_flattened_html(page)
             soup = BeautifulSoup(content, "html.parser")
 
             if self.recursive:
